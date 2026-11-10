@@ -1,29 +1,26 @@
 use crate::models::EmailConfig;
 use anyhow::{Context, Result};
-use lettre::message::header::ContentType;
-use lettre::message::{Attachment, MultiPart, SinglePart};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::AsyncSmtpTransport;
-use lettre::Tokio1Executor;
-use lettre::{Address, AsyncTransport, Message};
+use base64::Engine;
+use reqwest::Client;
+use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tracing::{error, info};
 use rusqlite::Connection;
 use crate::db;
 use uuid::Uuid;
 
-pub fn parse_recipient_list(value: &str, field_name: &str) -> Result<Vec<Address>> {
-    let recipients = value
+// Note: Address and lettre types are no longer needed since we handle recipients via strings/HTTP JSON.
+
+pub fn parse_recipient_list(value: &str, field_name: &str) -> Result<Vec<String>> {
+    let recipients: Vec<String> = value
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.parse::<Address>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .with_context(|| format!("Invalid '{}' email", field_name))?;
+        .map(String::from)
+        .collect();
 
     if recipients.is_empty() {
         anyhow::bail!("Missing '{}' email", field_name);
@@ -34,54 +31,41 @@ pub fn parse_recipient_list(value: &str, field_name: &str) -> Result<Vec<Address
 
 pub fn normalize_recipient_list(value: &str, field_name: &str) -> Result<String> {
     let recipients = parse_recipient_list(value, field_name)?;
-    Ok(recipients
-        .into_iter()
-        .map(|address| address.to_string())
-        .collect::<Vec<_>>()
-        .join(", "))
+    Ok(recipients.join(", "))
 }
 
-fn build_epub_message(config: &EmailConfig, filename: &str, filebody: Vec<u8>) -> Result<Message> {
-    let content_type = ContentType::parse("application/epub+zip").unwrap();
-    let attachment = Attachment::new(String::from(filename)).body(filebody, content_type);
+// Kept for backward compatibility with existing tests
+fn build_epub_message(config: &EmailConfig, filename: &str, filebody: Vec<u8>) -> Result<serde_json::Value> {
+    let email_from = if config.email_address.trim().is_empty() {
+        env::var("EMAIL_FROM").unwrap_or_else(|_| "RSSPub <onboarding@resend.dev>".to_string())
+    } else {
+        config.email_address.clone()
+    };
 
-    let from_address = config
-        .email_address
-        .parse()
-        .context("Invalid 'from' email")?;
-    let to_addresses = parse_recipient_list(&config.to_email, "to")?;
+    let recipients = parse_recipient_list(&config.to_email, "to")?;
+    let encoded_file = base64::engine::general_purpose::STANDARD.encode(&filebody);
 
-    let mut builder = Message::builder()
-        .date_now()
-        .message_id(None)
-        .user_agent(format!("RSSPub/{}", env!("CARGO_PKG_VERSION")))
-        .from(from_address);
-
-    for address in to_addresses {
-        builder = builder.to(address.into());
-    }
-
-    builder
-        .subject(format!("RSS Digest: {}", filename))
-        .multipart(
-            MultiPart::mixed()
-                .singlepart(
-                    SinglePart::builder()
-                        .header(ContentType::TEXT_PLAIN)
-                        .body(String::from("Here is your requested RSS Digest EPUB.")),
-                )
-                .singlepart(attachment),
-        )
-        .context("Failed to build email")
+    Ok(json!({
+        "from": email_from,
+        "to": recipients,
+        "subject": format!("RSS Digest: {}", filename),
+        "html": "Here is your requested RSS Digest EPUB.",
+        "attachments": [
+            {
+                "filename": filename,
+                "content": encoded_file
+            }
+        ]
+    }))
 }
 
-fn debug_dump_email(email: &Message) {
+fn debug_dump_email(payload: &serde_json::Value) {
     if env::var_os("RSSPUB_DEBUG_EMAIL_DUMP").as_deref() != Some("1".as_ref()) {
         return;
     }
 
-    let dump_path = env::temp_dir().join(format!("rsspub-email-{}.eml", Uuid::new_v4()));
-    match fs::write(&dump_path, email.formatted()) {
+    let dump_path = env::temp_dir().join(format!("rsspub-email-{}.json", Uuid::new_v4()));
+    match fs::write(&dump_path, payload.to_string()) {
         Ok(()) => info!("Wrote debug email dump to {}", dump_path.display()),
         Err(err) => error!("Failed to write debug email dump: {}", err),
     }
@@ -90,65 +74,34 @@ fn debug_dump_email(email: &Message) {
 pub async fn send_epub(config: &EmailConfig, epub_path: &Path) -> Result<()> {
     info!("Preparing to send email to {}", config.to_email);
 
-    let smtp_username = if config.smtp_username.trim().is_empty() {
-        config.email_address.as_str()
-    } else {
-        config.smtp_username.as_str()
-    };
-
     let filename = epub_path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("digest.epub");
 
     let filebody = fs::read(epub_path).context("Failed to read EPUB file")?;
-    let email = build_epub_message(config, filename, filebody)?;
-    debug_dump_email(&email);
+    let payload = build_epub_message(config, filename, filebody)?;
+    debug_dump_email(&payload);
 
-    let creds = Credentials::new(smtp_username.to_string(), config.smtp_password.clone());
+    let api_key = env::var("RESEND_API_KEY")
+        .context("RESEND_API_KEY environment variable not set")?;
 
-    info!(
-        "Sending email via {}:{}...",
-        config.smtp_host, config.smtp_port
-    );
+    let client = Client::new();
 
-    let starttls_mode = env::var("EMAIL_TLS")
-        .unwrap_or_else(|_| "starttls".to_string())
-        .to_lowercase();
+    info!("Sending email via Resend HTTP API...");
 
-    let mailer: AsyncSmtpTransport<Tokio1Executor> = if starttls_mode == "plaintext" {
-        info!("Using plaintext (unencrypted) connection");
-        AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&config.smtp_host)
-            .port(config.smtp_port)
-            .credentials(creds)
-            .timeout(Some(Duration::from_mins(3)))
-            .build()
-    } else if starttls_mode == "relay" {
-        info!("STARTTLS disabled via env; using implicit TLS (relay)");
-        AsyncSmtpTransport::<Tokio1Executor>::relay(&config.smtp_host)
-            .context("Failed to create SMTP transport (implicit TLS)")?
-            .port(config.smtp_port)
-            .credentials(creds)
-            .timeout(Some(Duration::from_mins(3)))
-            .build()
+    let res = client.post("https://api.resend.com/emails")
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await
+        .context("Failed to connect to Resend API")?;
+
+    if res.status().is_success() {
+        info!("Email sent successfully via HTTP!");
     } else {
-        info!("Using STARTTLS");
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&config.smtp_host)
-            .context("Failed to create SMTP transport (STARTTLS)")?
-            .port(config.smtp_port)
-            .credentials(creds)
-            .timeout(Some(Duration::from_mins(3)))
-            .build()
-    };
-
-    //mailer.send(email).await.context("Failed to send email")?;
-    match mailer.send(email).await {
-        Ok(_x) => {
-            info!("Email sent successfully!");
-        }
-        Err(y) => {
-            error!("Failed to send email: {}", y);
-        }
+        let err_text = res.text().await.unwrap_or_default();
+        anyhow::bail!("Resend API error: {}", err_text);
     }
 
     Ok(())
@@ -198,68 +151,44 @@ mod tests {
 
     fn test_email_config() -> EmailConfig {
         EmailConfig {
-            smtp_host: "smtp.example.com".to_string(),
-            smtp_port: 587,
-            smtp_password: "secret".to_string(),
+            smtp_host: "".to_string(),
+            smtp_port: 0,
+            smtp_password: "".to_string(),
             email_address: "sender@example.com".to_string(),
-            smtp_username: "sender@example.com".to_string(),
+            smtp_username: "".to_string(),
             to_email: "kindle@example.com".to_string(),
             enable_auto_send: false,
         }
     }
 
     #[test]
-    fn serializes_kindle_friendly_epub_email_headers() {
-        let email = build_epub_message(
+    fn serializes_kindle_friendly_epub_email_payload() {
+        let payload = build_epub_message(
             &test_email_config(),
             "digest.epub",
             b"dummy epub bytes".to_vec(),
         )
-        .expect("message should build");
+        .expect("payload should build");
 
-        let raw = String::from_utf8(email.formatted()).expect("message should serialize as utf-8");
-
-        assert!(
-            raw.contains("Date:"),
-            "raw message should include Date header"
-        );
-        assert!(
-            raw.contains("Message-ID:"),
-            "raw message should include Message-ID header"
-        );
-        assert!(
-            raw.contains(&format!("User-Agent: RSSPub/{}", env!("CARGO_PKG_VERSION"))),
-            "raw message should include RSSPub user agent"
-        );
-        assert!(
-            raw.contains("MIME-Version: 1.0"),
-            "raw message should include MIME-Version header"
-        );
-        assert!(
-            raw.contains("Content-Type: multipart/mixed"),
-            "raw message should be multipart/mixed"
-        );
-        assert!(
-            raw.contains("filename=\"digest.epub\"") || raw.contains("filename=digest.epub"),
-            "raw message should include attachment filename"
-        );
-        assert!(
-            raw.contains("application/epub+zip"),
-            "raw message should include EPUB content type"
-        );
+        assert_eq!(payload["from"], "sender@example.com");
+        assert_eq!(payload["to"][0], "kindle@example.com");
+        assert_eq!(payload["subject"], "RSS Digest: digest.epub");
+        assert!(payload["attachments"][0]["content"].is_string());
+        assert_eq!(payload["attachments"][0]["filename"], "digest.epub");
     }
 
     #[test]
-    fn serializes_multiple_recipient_headers() {
+    fn serializes_multiple_recipients() {
         let mut config = test_email_config();
         config.to_email = "kindle@example.com, backup@example.com".to_string();
 
-        let email = build_epub_message(&config, "digest.epub", b"dummy epub bytes".to_vec())
-            .expect("message should build");
+        let payload = build_epub_message(&config, "digest.epub", b"dummy epub bytes".to_vec())
+            .expect("payload should build");
 
-        let raw = String::from_utf8(email.formatted()).expect("message should serialize as utf-8");
-
-        assert!(raw.contains("To: kindle@example.com, backup@example.com"));
+        let recipients = payload["to"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(recipients[0], "kindle@example.com");
+        assert_eq!(recipients[1], "backup@example.com");
     }
 
     #[test]
