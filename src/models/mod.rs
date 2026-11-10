@@ -76,18 +76,18 @@ fn default_timezone() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmailConfig {
-    pub email_address: String,
-    pub to_email: String,
-    pub enable_auto_send: bool,
-    // Optional: Keep these as optional fields with defaults so old database rows don't crash
     #[serde(default)]
     pub smtp_host: String,
     #[serde(default)]
     pub smtp_port: u16,
     #[serde(default)]
-    pub smtp_username: String,
-    #[serde(default)]
     pub smtp_password: String,
+    #[serde(default)]
+    pub smtp_username: String,
+    pub email_address: String,
+    pub to_email: String,
+    #[serde(default)]
+    pub enable_auto_send: bool,
 }
 
 pub struct AppState {
