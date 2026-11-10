@@ -3,14 +3,9 @@
     import { emailConfig, isAuthenticated, popup } from "../lib/store";
     import type { EmailConfig } from "../lib/types";
 
-    let smtp_host = "";
-    let smtp_port: number | null = null;
-    let smtp_username = "";
-    let smtp_password = "";
     let email_address = "";
     let to_email = "";
     let enable_auto_send = false;
-    let useSeparateUsername = false;
     let statusMsg = "";
     let statusColor = "";
     let isSaving = false;
@@ -32,17 +27,9 @@
             const config = await api("/email-config") as EmailConfig | null;
             if (config) {
                 emailConfig.set(config);
-                smtp_host = config.smtp_host || "";
-                smtp_port = config.smtp_port || null;
-
-                smtp_username = config.smtp_username || "";
-                smtp_password = config.smtp_password || "";
                 email_address = config.email_address || "";
                 to_email = config.to_email || "";
                 enable_auto_send = config.enable_auto_send || false;
-
-                // If backend returns a non-empty username, assume user uses a separate one
-                useSeparateUsername = !!config.smtp_username;
             }
         } catch (e) {
             console.error("Failed to load email config", e);
@@ -58,10 +45,6 @@
 
         try {
             await api("/email-config", "POST", {
-                smtp_host,
-                smtp_port: smtp_port || 0,
-                smtp_username: useSeparateUsername ? smtp_username : "",
-                smtp_password,
                 email_address,
                 to_email,
                 enable_auto_send,
@@ -85,18 +68,12 @@
             await saveEmailConfig();
         }
     }
-
-    function handleUsernameToggleChange() {
-        if (!useSeparateUsername) {
-            smtp_username = "";
-        }
-    }
 </script>
 
 <section id="email-config-section" class="card" style="grid-column: 1 / -1">
     <div class="card-header">
         <img src="/icons/mail.svg" alt="Email Icon" width="20" height="20" />
-        <h2>Email Configuration</h2>
+        <h2>Email Configuration (Resend HTTP)</h2>
         <label
             style="margin-left: auto; display: flex; align-items: center; gap: 10px;"
         >
@@ -118,62 +95,34 @@
         <form on:submit|preventDefault={saveEmailConfig} id="email-config-form">
             <div
                 id="email-inputs-wrapper"
-                style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;"
+                style="display: flex; flex-direction: column; gap: 15px; margin-bottom: 15px;"
             >
-                <input
-                    type="text"
-                    bind:value={smtp_host}
-                    placeholder="SMTP Host (e.g. smtp.gmail.com)"
-                    required
-                />
-                <input
-                    type="number"
-                    bind:value={smtp_port}
-                    placeholder="Port (e.g. 587)"
-                    required
-                />
-
-                <label
-                    id="separate-username-toggle"
-                    style="display: flex; align-items: center; gap: 8px; grid-column: 1 / -1; cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--text-secondary);"
-                >
+                <div>
+                    <label style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 5px;">
+                        Sender Email Address (Optional, defaults to Render environment variable)
+                    </label>
                     <input
-                        type="checkbox"
-                        bind:checked={useSeparateUsername}
-                        on:change={handleUsernameToggleChange}
-                        style="accent-color: var(--accent); width: 16px; height: 16px; cursor: pointer;"
+                        type="email"
+                        bind:value={email_address}
+                        placeholder="e.g. updates@yourdomain.com"
                     />
-                    Use separate SMTP username than email
-                </label>
+                </div>
 
-                {#if useSeparateUsername}
+                <div>
+                    <label style="display: block; font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 5px;">
+                        Recipient Email(s)
+                    </label>
                     <input
-                        type="text"
-                        bind:value={smtp_username}
-                        placeholder="SMTP Username (optional)"
+                        type="email"
+                        bind:value={to_email}
+                        placeholder="kindle@example.com, backup@example.com"
+                        multiple
+                        required
                     />
-                {/if}
-                <input
-                    type="password"
-                    bind:value={smtp_password}
-                    placeholder="SMTP Password (leave empty to keep)"
-                />
-                <input
-                    type="email"
-                    bind:value={email_address}
-                    placeholder="Email Address"
-                    required
-                />
-                <input
-                    type="email"
-                    bind:value={to_email}
-                    placeholder="To Email(s), comma separated"
-                    multiple
-                    required
-                />
+                </div>
             </div>
             <div style="margin: 0 0 15px; font-size: 0.85rem; color: var(--text-secondary);">
-                Multiple recipients can be separated with commas.
+                Multiple recipients can be separated with commas. Note: Your Resend API key is managed securely via Render environment variables (`RESEND_API_KEY`).
             </div>
             <button
                 type="submit"
